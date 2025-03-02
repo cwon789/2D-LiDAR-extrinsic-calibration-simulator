@@ -102,7 +102,6 @@ class LidarCalibrationNode(Node):
         cosy = 1.0 - 2.0 * (oy * oy + oz * oz)
         yaw = math.atan2(siny, cosy)
 
-        # ROS에서 넘어온 pose를 (theta, x, y) 로 저장
         current_pose = (yaw, px, py)
 
         if self.prev_pose is None:
@@ -124,13 +123,10 @@ class LidarCalibrationNode(Node):
 
     def get_increment(self, poseA, poseB):
         """
-        poseA->poseB로 가는 증분 transform (thetaB - thetaA, (xB,yB) - (xA,yA) with rotation)
-        즉  Δ = A^-1 ⊕ B
+        poseA->poseB로 가는 증분 transform (Δ = A^-1 ⊕ B)
         """
-        # Δ = poseA^-1 ⊕ poseB
         invA = se2_invert(poseA)
         delta = se2_compose(invA, poseB)
-        # delta = (Δtheta, Δx, Δy)
         return delta
 
     ############################################################
@@ -145,7 +141,7 @@ class LidarCalibrationNode(Node):
             TdT = se2_compose(Td, se2_invert(T))
             # translation만 추출
             (dx, dy) = se2_translation(TdT)
-            # 여기서 ideally (dx, dy) = (0, 0)
+            # ideally (dx, dy) = (0, 0)
             sse += (dx*dx + dy*dy)
         return sse
 
@@ -161,7 +157,7 @@ class LidarCalibrationNode(Node):
             return self.cost_extrinsic(th, xx, yy)
 
         x0 = [init_th, init_x, init_y]
-        res = minimize(cost_fn, x0, method='BFGS')  # or any other method
+        res = minimize(cost_fn, x0, method='BFGS')
         (th_opt, x_opt, y_opt) = res.x
         cost_val = res.fun
         # theta를 0~2π 범위로 정규화
@@ -178,15 +174,12 @@ class LidarCalibrationNode(Node):
             self.theta_ext, self.x_ext, self.y_ext
         )
 
-        # alpha 비율로 보간
         old_th = self.theta_ext
         old_x = self.x_ext
         old_y = self.y_ext
 
-        # 각도 보간은 그냥 수치적 보간(간단히):
-        #   new_th = old_th + alpha*(th_star - old_th)
-        # (혹은 quaternions 등 다른 방법 가능)
-        new_th = old_th + alpha * ((th_star - old_th))
+        # theta 보간 (수치적 단순 보간)
+        new_th = old_th + alpha * (th_star - old_th)
         new_th = (new_th + 2*math.pi) % (2*math.pi)
 
         new_x = old_x + alpha * (x_star - old_x)
@@ -197,7 +190,7 @@ class LidarCalibrationNode(Node):
         self.y_ext = new_y
 
         # cost_val은 sum of squared distances
-        # "평균 거리"를 대략 보고 싶으면:
+        # 평균 오차(RMS) 계산
         N = len(self.delta_odom)
         if N > 0:
             mean_sq = cost_val / N
@@ -215,20 +208,15 @@ class LidarCalibrationNode(Node):
         self.odom_poses: LiDAR 누적포즈들
         T = (theta_ext, x_ext, y_ext)
 
-        base_link 상에서의 누적포즈 = T ⊕ LiDAR_pose_i ⊕ T^-1 ?? 
-          - 실제 "로봇이 base_link에서 어떻게 움직였는가"를 보여주려면,
-            "제자리 회전"이면 ideally (0,0)에만 있어야 하겠지만
-            누적 yaw는 남길 수 있음.
-        여기서는 단순히 base_link의 (x, y)만 플롯해보자.
+        base_link_pose_i = T ⊕ p_i ⊕ T^-1
+        (그중 (x,y)만 반환)
         """
         result = []
         T = (self.theta_ext, self.x_ext, self.y_ext)
         T_inv = se2_invert(T)
         for p in self.odom_poses:
-            # base_link_pose = T ⊕ p ⊕ T^-1
             Tp = se2_compose(T, p)
             basePose = se2_compose(Tp, T_inv)
-            # translation
             (bx, by) = se2_translation(basePose)
             result.append((bx, by))
         return result
@@ -241,6 +229,7 @@ class CalibrationGUI:
     def __init__(self, node):
         self.node = node
 
+        # GUI 메인 윈도우
         self.root = tk.Tk()
         self.root.title("Incremental Delta-based Calibration")
 
@@ -248,55 +237,95 @@ class CalibrationGUI:
         self.calibrating_translation = False
         self.trans_error = 0.0
 
-        # 상단 프레임
+        # extrinsic 시간 변화 기록 (그래프용)
+        self.t_data = []
+        self.x_ext_data = []
+        self.y_ext_data = []
+        self.plot_time = 0.0  # 0.1초 간격으로 누적
+
+        # -----------------------------
+        # (1) 상단 프레임: 구독, Threshold, LR
+        # -----------------------------
         frame_top = ttk.Frame(self.root)
         frame_top.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
+        # 구독 버튼
         btn_sub = ttk.Button(frame_top, text="Subscribe Odom", command=self.subscribe_odom)
         btn_sub.pack(side=tk.LEFT, padx=5)
 
         self.label_odom_status = ttk.Label(frame_top, text="Not Subscribed", foreground="red")
         self.label_odom_status.pack(side=tk.LEFT, padx=5)
 
-        # threshold & LR
+        # Threshold & LR
         ttk.Label(frame_top, text="Trans Thr:").pack(side=tk.LEFT, padx=2)
         self.entry_trans_threshold = ttk.Entry(frame_top, width=6)
-        self.entry_trans_threshold.insert(0, "0.01")
+        self.entry_trans_threshold.insert(0, "0.002")
         self.entry_trans_threshold.pack(side=tk.LEFT, padx=2)
 
         ttk.Label(frame_top, text="LR:").pack(side=tk.LEFT, padx=2)
         self.entry_trans_lr = ttk.Entry(frame_top, width=6)
-        self.entry_trans_lr.insert(0, "0.5")
+        self.entry_trans_lr.insert(0, "0.01")
         self.entry_trans_lr.pack(side=tk.LEFT, padx=2)
 
         btn_trans_cal = ttk.Button(frame_top, text="Start Trans Cal", command=self.start_translation_cal)
         btn_trans_cal.pack(side=tk.LEFT, padx=5)
 
-        # Extrinsic 표시
+        # -----------------------------
+        # (2) Extrinsic 표시
+        # -----------------------------
         frame_ext = ttk.Frame(self.root)
         frame_ext.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
         self.label_xy_ext = ttk.Label(frame_ext, text="x_ext=0.0, y_ext=0.0")
         self.label_xy_ext.pack(side=tk.LEFT, padx=5)
+
         self.label_theta_ext = ttk.Label(frame_ext, text="theta_ext=0.0°")
         self.label_theta_ext.pack(side=tk.LEFT, padx=5)
 
-        # 에러 표시
+        # -----------------------------
+        # (3) 에러 표시
+        # -----------------------------
         frame_err = ttk.Frame(self.root)
         frame_err.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
         self.label_trans_error = ttk.Label(frame_err, text="Trans Error=0.0")
         self.label_trans_error.pack(side=tk.LEFT, padx=5)
 
-        # Matplotlib
-        self.fig = plt.Figure(figsize=(6, 5), dpi=100)
-        self.ax = self.fig.add_subplot(1, 1, 1)
-        self.ax.set_aspect('equal', 'box')
-        self.ax.grid(True)
+        # -----------------------------
+        # (4) Matplotlib Figure
+        # -----------------------------
+        # 1행 3열: (Path) - (x_ext vs Time) - (y_ext vs Time)
+        self.fig = plt.Figure(figsize=(12, 4), dpi=100)
+
+        # (1,1) Base Link 경로
+        self.ax_path = self.fig.add_subplot(1, 3, 1)
+        self.ax_path.set_aspect('equal', 'box')
+        self.ax_path.set_title("Base Link Trajectory")
+        self.ax_path.grid(True)
+
+        # (1,2) x_ext vs Time
+        self.ax_x_ext = self.fig.add_subplot(1, 3, 2)
+        self.ax_x_ext.set_title("x_ext vs. Time")
+        self.ax_x_ext.set_xlabel("Time [s]")
+        self.ax_x_ext.set_ylabel("x_ext [m]")
+        self.ax_x_ext.grid(True)
+
+        # (1,3) y_ext vs Time
+        self.ax_y_ext = self.fig.add_subplot(1, 3, 3)
+        self.ax_y_ext.set_title("y_ext vs. Time")
+        self.ax_y_ext.set_xlabel("Time [s]")
+        self.ax_y_ext.set_ylabel("y_ext [m]")
+        self.ax_y_ext.grid(True)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # 주기적 업데이트
         self.update_plot()
 
+    ############################################################
+    # 버튼 콜백
+    ############################################################
     def subscribe_odom(self):
         self.node.subscribe_odometry()
         self.label_odom_status.config(text="Subscribed", foreground="green")
@@ -305,31 +334,59 @@ class CalibrationGUI:
         self.calibrating_translation = True
         self.trans_error = 9999.9
 
+    ############################################################
+    # 주기적(100ms) 업데이트
+    ############################################################
     def update_plot(self):
+        # (1) 캘리브레이션 진행
         if self.calibrating_translation:
             thr = float(self.entry_trans_threshold.get())
             alpha = float(self.entry_trans_lr.get())
             err = self.node.calibrate_translation_step(alpha)
             self.trans_error = err
+            # 예: 오차가 threshold 이하일 때 중단
             # if err < thr:
             #     self.calibrating_translation = False
 
-        # 플롯
-        self.ax.clear()
-        self.ax.set_title("Base Link Trajectory (should be near (0,0))")
-        self.ax.set_aspect('equal', 'box')
-        self.ax.grid(True)
+        # (2) 시간축 데이터 기록
+        self.plot_time += 0.1  # 100ms마다 0.1초 증가
+        self.t_data.append(self.plot_time)
+        self.x_ext_data.append(self.node.x_ext)
+        self.y_ext_data.append(self.node.y_ext)
+
+        # (3) 플롯 업데이트
+        # 3-1) Path Plot
+        self.ax_path.clear()
+        self.ax_path.set_title("Base Link Trajectory")
+        self.ax_path.set_aspect('equal', 'box')
+        self.ax_path.grid(True)
 
         pts = self.node.get_transformed_points()
         if len(pts) > 0:
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            self.ax.plot(xs, ys, 'b.-', label="Base Link Trajectory")
-            self.ax.legend()
+            self.ax_path.plot(xs, ys, 'b.-', label="Trajectory")
+            self.ax_path.legend()
+
+        # 3-2) x_ext vs Time
+        self.ax_x_ext.clear()
+        self.ax_x_ext.set_title("x_ext vs. Time")
+        self.ax_x_ext.set_xlabel("Time [s]")
+        self.ax_x_ext.set_ylabel("x_ext [m]")
+        self.ax_x_ext.grid(True)
+        self.ax_x_ext.plot(self.t_data, self.x_ext_data, 'r.-')
+
+        # 3-3) y_ext vs Time
+        self.ax_y_ext.clear()
+        self.ax_y_ext.set_title("y_ext vs. Time")
+        self.ax_y_ext.set_xlabel("Time [s]")
+        self.ax_y_ext.set_ylabel("y_ext [m]")
+        self.ax_y_ext.grid(True)
+        self.ax_y_ext.plot(self.t_data, self.y_ext_data, 'g.-')
 
         self.canvas.draw()
 
-        # 라벨 업데이트
+        # (4) 라벨 업데이트
         self.label_xy_ext.config(
             text=f"x_ext={self.node.x_ext:.4f}, y_ext={self.node.y_ext:.4f}"
         )
@@ -338,10 +395,12 @@ class CalibrationGUI:
         self.label_theta_ext.config(text=f"theta_ext={deg_signed:.2f}°")
         self.label_trans_error.config(text=f"Trans Error={self.trans_error:.4f}")
 
+        # (5) 100ms 후 재호출
         self.root.after(100, self.update_plot)
 
     def run(self):
         self.root.mainloop()
+
 
 ############################################################
 # main
